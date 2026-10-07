@@ -58,15 +58,16 @@ def save_settings(settings):
     except Exception as e:
         print(f"[Settings] Error saving: {e}")
 
-# Single instance lock using Win32 Mutex
-ERROR_ALREADY_EXISTS = 183
-mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "SoundCloudDesktopPySingleInstanceMutex")
-if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-    hwnd = ctypes.windll.user32.FindWindowW(None, "SoundCloud")
-    if hwnd:
-        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
-    sys.exit(0)
+def check_single_instance():
+    ERROR_ALREADY_EXISTS = 183
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "SoundCloudDesktopPySingleInstanceMutex")
+    if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        hwnd = ctypes.windll.user32.FindWindowW(None, "SoundCloud")
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        sys.exit(0)
+    return mutex
 
 # JavaScript Injected Script
 INJECTED_JS = r"""
@@ -84,18 +85,71 @@ INJECTED_JS = r"""
         };
     }
 
-    // Auto-dismiss OneTrust banner and eliminate dark overlay
-    function removeOneTrust() {
+    // Auto-dismiss OneTrust banner, promo banners, and Google One Tap
+    function purgePopups() {
         try {
-            const cookieBtn = document.querySelector('#onetrust-accept-btn-handler');
-            if (cookieBtn) cookieBtn.click();
-            const filter = document.querySelector('.onetrust-pc-dark-filter');
-            if (filter) filter.remove();
-            if (document.body && document.body.classList.contains('ot-overlay-open')) {
-                document.body.classList.remove('ot-overlay-open');
-            }
+            const acceptBtn = document.querySelector('#onetrust-accept-btn-handler');
+            if (acceptBtn) acceptBtn.click();
+            const rejectBtn = document.querySelector('#onetrust-reject-all-handler');
+            if (rejectBtn) rejectBtn.click();
         } catch (e) {}
+
+        const selectorsToRemove = [
+            '#onetrust-consent-sdk',
+            '#onetrust-banner-sdk',
+            '.onetrust-pc-dark-filter',
+            'div[id*="onetrust"]',
+            'div[class*="onetrust"]',
+            '.announcements',
+            '.announcements__listContainer',
+            '.l-product-banners',
+            '.banner.m-get_heard',
+            '#credential_picker_container',
+            '#credential_picker_iframe',
+            'iframe[src*="accounts.google.com/gsi"]',
+            '.upsellBanner',
+            '.cookiePolicy',
+            'div[class*="upsell"]'
+        ];
+
+        selectorsToRemove.forEach(sel => {
+            document.querySelectorAll(sel).forEach(el => {
+                try { el.remove(); } catch (e) { el.style.display = 'none'; }
+            });
+        });
+
+        if (document.body) {
+            document.body.classList.remove('ot-overlay-open');
+            document.body.style.overflow = 'auto';
+        }
+        if (document.documentElement) {
+            document.documentElement.classList.remove('ot-overlay-open');
+            document.documentElement.style.overflow = 'auto';
+        }
     }
+
+    // Force internal SoundCloud links with target="_blank" to open in the same window
+    document.addEventListener('click', function(e) {
+        const a = e.target && e.target.closest ? e.target.closest('a') : null;
+        if (!a || !a.href) return;
+        if (a.href.includes('soundcloud.com')) {
+            if (a.target === '_blank') {
+                a.target = '_self';
+            }
+        }
+    }, true);
+
+    // Intercept window.open to keep SoundCloud navigation inside the app
+    const _origOpen = window.open;
+    window.open = function(url, target, features) {
+        if (url && typeof url === 'string') {
+            if (url.includes('soundcloud.com') && !url.includes('/connect') && !url.includes('/signin')) {
+                window.location.href = url;
+                return window;
+            }
+        }
+        return _origOpen.apply(this, arguments);
+    };
 
     // Parse time strings into seconds
     function parseSeconds(str) {
@@ -308,7 +362,7 @@ INJECTED_JS = r"""
         setTimeout(checkState, 100);
     };
 
-    // Inject styles for dark scrollbar and dark filter suppression
+    // Inject styles for dark scrollbar and full popup / banner suppression
     const style = document.createElement('style');
     style.id = 'sc-desktop-style';
     style.textContent = `
@@ -326,27 +380,44 @@ INJECTED_JS = r"""
         ::-webkit-scrollbar-thumb:hover {
             background: #ff5500;
         }
+        #onetrust-consent-sdk,
+        #onetrust-banner-sdk,
         .onetrust-pc-dark-filter,
-        div[class*="onetrust-pc-dark-filter"] {
+        div[id*="onetrust"],
+        div[class*="onetrust"],
+        .announcements,
+        .announcements__listContainer,
+        .l-product-banners,
+        .banner.m-get_heard,
+        #credential_picker_container,
+        #credential_picker_iframe,
+        iframe[src*="accounts.google.com/gsi"],
+        .upsellBanner,
+        .cookiePolicy,
+        div[class*="upsell"] {
             display: none !important;
             opacity: 0 !important;
+            height: 0 !important;
+            max-height: 0 !important;
             visibility: hidden !important;
             pointer-events: none !important;
             z-index: -999999 !important;
+            overflow: hidden !important;
         }
-        body.ot-overlay-open {
+        body.ot-overlay-open,
+        html.ot-overlay-open {
             overflow: auto !important;
         }
     `;
     document.head.appendChild(style);
 
-    removeOneTrust();
+    purgePopups();
     checkState();
 
     // DOM Observer
     const observer = new MutationObserver(() => {
         checkState();
-        removeOneTrust();
+        purgePopups();
     });
     observer.observe(document.body, {
         childList: true,
@@ -358,9 +429,13 @@ INJECTED_JS = r"""
     // Event listener when pywebview is ready
     window.addEventListener('pywebviewready', () => {
         checkState();
+        purgePopups();
     });
 
-    setInterval(checkState, 250);
+    setInterval(() => {
+        checkState();
+        purgePopups();
+    }, 250);
 })();
 """
 
@@ -536,8 +611,12 @@ class SoundCloudApp:
         sys.exit(0)
 
     def on_loaded(self):
-        # Inject script on page load
+        # Inject script immediately and after a short delay on page load
         def _inject():
+            try:
+                self.window.evaluate_js(INJECTED_JS)
+            except Exception:
+                pass
             time.sleep(0.5)
             try:
                 self.window.evaluate_js(INJECTED_JS)
@@ -613,5 +692,6 @@ class SoundCloudApp:
         )
 
 if __name__ == "__main__":
+    _mutex = check_single_instance()
     app = SoundCloudApp()
     app.run()
