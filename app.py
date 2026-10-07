@@ -368,7 +368,6 @@ class SoundCloudApp:
     def __init__(self):
         self.settings = load_settings()
         self.window = None
-        self.form = None
         self.hwnd = None
         self.taskbar = None
         self.tray = None
@@ -439,13 +438,18 @@ class SoundCloudApp:
     def toggle_window(self):
         if not self.window:
             return
-        if not self.form:
-            self.form = BrowserView.instances.get(self.window.uid)
-        if self.form:
-            if self.form.Visible:
-                self.window.hide()
-            else:
-                self.window.show()
+        is_visible = False
+        if self.hwnd:
+            try:
+                is_visible = bool(ctypes.windll.user32.IsWindowVisible(self.hwnd))
+            except Exception:
+                pass
+
+        if is_visible:
+            self.window.hide()
+        else:
+            self.window.show()
+            if self.hwnd:
                 try:
                     ctypes.windll.user32.SetForegroundWindow(self.hwnd)
                 except Exception:
@@ -543,13 +547,15 @@ class SoundCloudApp:
 
     def run(self):
         class JsApi:
-            def __init__(self, app):
-                self.app = app
+            def __init__(self, callback):
+                self._callback = callback
+
             def on_player_state(self, state):
-                self.app.on_player_state(state)
+                if self._callback:
+                    self._callback(state)
                 return True
 
-        js_api = JsApi(self)
+        js_api = JsApi(self.on_player_state)
 
         bounds = self.settings.get("window_bounds", {"width": 1280, "height": 860})
         width = max(800, bounds.get("width", 1280))
@@ -570,9 +576,9 @@ class SoundCloudApp:
 
         def on_started(w):
             time.sleep(1)
-            self.form = BrowserView.instances.get(w.uid)
-            if self.form:
-                self.hwnd = self.form.Handle.ToInt64()
+            form = BrowserView.instances.get(w.uid)
+            if form:
+                self.hwnd = form.Handle.ToInt64()
                 # Initialize Windows Taskbar Manager
                 self.taskbar = TaskbarManager(self.hwnd, self.on_taskbar_command, assets_dir=ASSETS_DIR)
                 # Maximize if previously saved
