@@ -1,0 +1,33 @@
+{
+  "name": "soundcloud-desktop",
+  "version": "1.0.0",
+  "description": "SoundCloud Desktop Application with Windows Taskbar Thumbnail Toolbar Media Controls",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:assets": "node scripts/generate-assets.js && node scripts/convert-thumbar-ico.js",
+    "dist": "electron-packager . SoundCloud --platform=win32 --arch=x64 --icon=assets/icon.ico --out=dist --overwrite --prune=true",
+    "test": "node scripts/generate-assets.js"
+  },
+  "keywords": [
+    "soundcloud",
+    "desktop",
+    "electron",
+    "windows",
+    "taskbar",
+    "thumbar",
+    "media-controls"
+  ],
+  "author": "SoundCloud Desktop",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^44.6.0",
+    "pngjs": "^7.0.0",
+    "to-ico": "^1.1.5"
+  },
+  "dependencies": {
+    "discord-rpc": "^4.0.1"
+  }
+}
