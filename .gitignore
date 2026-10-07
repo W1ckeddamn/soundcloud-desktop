@@ -17,3 +17,15 @@ Thumbs.db
 .vscode/
 .idea/
 *.lnk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.spec
+build/
+.env
+.venv
+env/
+venv/
+

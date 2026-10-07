@@ -1,0 +1,6 @@
+pywebview>=5.0.0
+pythonnet>=3.0.0
+pypresence>=4.3.0
+pystray>=0.19.5
+Pillow>=10.0.0
+comtypes>=1.4.0
