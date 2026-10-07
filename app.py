@@ -7,6 +7,9 @@ import threading
 from ctypes import wintypes
 from PIL import Image
 import pystray
+import webbrowser
+import clr
+from System import Action
 import webview
 from webview.platforms.winforms import BrowserView
 
@@ -21,6 +24,8 @@ except Exception:
 
 # User Agent matching standard Google Chrome on Windows 10/11
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+# Firefox User Agent for Google OAuth to avoid "disallowed_useragent" / "insecure browser" blocks
+FIREFOX_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
 
 # Paths
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -583,6 +588,20 @@ class SoundCloudApp:
         self.window.events.closing += self.on_closing
         self.window.events.loaded += self.on_loaded
 
+        # Handle Google OAuth by rewriting User-Agent and stripping Sec-Ch-Ua headers
+        def on_request_sent(request):
+            try:
+                url = getattr(request, 'url', '') or ''
+                if any(g in url for g in ("accounts.google.com", "google.com/signin", "google.com/oauth")):
+                    request.headers["User-Agent"] = FIREFOX_USER_AGENT
+                    request.headers.pop("Sec-Ch-Ua", None)
+                    request.headers.pop("Sec-Ch-Ua-Mobile", None)
+                    request.headers.pop("Sec-Ch-Ua-Platform", None)
+            except Exception:
+                pass
+
+        self.window.events.request_sent += on_request_sent
+
         def on_started(w):
             time.sleep(1)
             form = BrowserView.instances.get(w.uid)
@@ -590,6 +609,35 @@ class SoundCloudApp:
                 self.hwnd = form.Handle.ToInt64()
                 # Initialize Windows Taskbar Manager
                 self.taskbar = TaskbarManager(self.hwnd, self.on_taskbar_command, assets_dir=ASSETS_DIR)
+
+                # Configure OAuth popups handling (allow Google, Apple, Facebook, SoundCloud popups)
+                def _setup_popups():
+                    try:
+                        core = form.browser.webview.CoreWebView2
+                        if core:
+                            core.NewWindowRequested -= form.browser.on_new_window_request
+
+                            def _on_new_window(sender, args):
+                                uri = str(args.get_Uri())
+                                is_auth = any(d in uri for d in [
+                                    "accounts.google.com", "google.com", "appleid.apple.com", "apple.com",
+                                    "facebook.com", "fb.com", "soundcloud.com", "sndcdn.com"
+                                ])
+                                if is_auth or not uri.startswith("http"):
+                                    args.set_Handled(False)  # Allows native popup window!
+                                else:
+                                    args.set_Handled(True)
+                                    webbrowser.open(uri)
+
+                            core.NewWindowRequested += _on_new_window
+                    except Exception as e:
+                        print(f"[Popup Setup Error] {e}")
+
+                try:
+                    form.Invoke(Action(_setup_popups))
+                except Exception as e:
+                    print(f"[Invoke Error] {e}")
+
                 # Maximize if previously saved
                 if self.settings.get("is_maximized", False):
                     try:
