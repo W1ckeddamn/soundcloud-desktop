@@ -145,7 +145,16 @@ INJECTED_JS = r"""
         const durationEl = document.querySelector('.playbackTimeline__duration > span[aria-hidden="true"], .playbackTimeline__duration');
         const progressWrapper = document.querySelector('.playbackTimeline__progressWrapper');
 
-        const isPlaying = playBtn ? (playBtn.classList.contains('playing') || (playBtn.title && (playBtn.title.toLowerCase().includes('pause') || playBtn.title.toLowerCase().includes('приостанов')))) : false;
+        let isPlaying = false;
+        if (typeof navigator !== 'undefined' && navigator.mediaSession && navigator.mediaSession.playbackState === 'playing') {
+            isPlaying = true;
+        } else if (playBtn) {
+            const titleAttr = (playBtn.getAttribute('title') || '').toLowerCase();
+            const ariaLabel = (playBtn.getAttribute('aria-label') || '').toLowerCase();
+            const isPauseBtn = titleAttr.includes('pause') || titleAttr.includes('приостанов') ||
+                               ariaLabel.includes('pause') || ariaLabel.includes('приостанов');
+            isPlaying = playBtn.classList.contains('playing') || isPauseBtn;
+        }
         const isDisabled = playBtn ? playBtn.classList.contains('disabled') : true;
 
         let title = '';
@@ -162,7 +171,9 @@ INJECTED_JS = r"""
         }
 
         if (!title && titleEl) {
-            title = (titleEl.innerText || titleEl.getAttribute('title') || '').trim();
+            const rawTitle = (titleEl.innerText || titleEl.getAttribute('title') || '').trim();
+            const lines = rawTitle.split('\n').map(s => s.trim()).filter(Boolean);
+            title = (lines[0] || rawTitle).replace(/^Current track:\s*/i, '').trim();
         }
         if (!artist && artistEl) {
             artist = (artistEl.innerText || artistEl.getAttribute('title') || '').trim();
@@ -199,13 +210,34 @@ INJECTED_JS = r"""
             if (max > 0) progress = Math.min(1, Math.max(0, now / max));
         }
 
-        const timePassed = timePassedEl ? timePassedEl.innerText.trim() : '';
-        const duration = durationEl ? durationEl.innerText.trim() : '';
+        function extractTimeText(el) {
+            if (!el) return '';
+            const span = el.querySelector('span[aria-hidden="true"]');
+            if (span) return span.innerText || span.textContent || '';
+            return el.innerText || el.textContent || '';
+        }
 
-        const currentSeconds = parseSeconds(timePassed);
-        let durationSeconds = parseSeconds(duration);
-        if (duration.startsWith('-')) {
-            durationSeconds = currentSeconds + durationSeconds;
+        const rawTimePassed = extractTimeText(timePassedEl).trim();
+        const rawDuration = extractTimeText(durationEl).trim();
+
+        function parseSeconds(str) {
+            if (!str || typeof str !== 'string') return 0;
+            const match = str.match(/(-)?\b(\d+):(\d{2})(?::(\d{2}))?\b/);
+            if (!match) return 0;
+            const isNegative = Boolean(match[1]);
+            const p1 = Number(match[2]);
+            const p2 = Number(match[3]);
+            const p3 = match[4] !== undefined ? Number(match[4]) : null;
+            let sec = (p3 !== null) ? (p1 * 3600 + p2 * 60 + p3) : (p1 * 60 + p2);
+            return isNegative ? -sec : sec;
+        }
+
+        const currentSeconds = Math.max(0, parseSeconds(rawTimePassed));
+        let durationSeconds = parseSeconds(rawDuration);
+        if (rawDuration.includes('-') && durationSeconds <= 0) {
+            durationSeconds = currentSeconds + Math.abs(durationSeconds);
+        } else {
+            durationSeconds = Math.max(0, durationSeconds);
         }
 
         const hasTrack = !isDisabled || Boolean(title);
@@ -221,8 +253,8 @@ INJECTED_JS = r"""
             artwork,
             trackUrl,
             progress,
-            timePassed,
-            duration,
+            timePassed: rawTimePassed,
+            duration: rawDuration,
             currentSeconds,
             durationSeconds,
             canPrev,
@@ -472,10 +504,12 @@ class SoundCloudApp:
         self.discord.set_enabled(new_val)
         if new_val:
             self.discord.update_state(self.current_state)
+        self.update_tray_menu()
 
     def toggle_close_to_tray(self, icon, item):
         self.settings["close_to_tray"] = not self.settings.get("close_to_tray", True)
         save_settings(self.settings)
+        self.update_tray_menu()
 
     def update_tray_menu(self):
         if not self.tray:
@@ -613,23 +647,67 @@ class SoundCloudApp:
                 # Configure OAuth popups handling (allow Google, Apple, Facebook, SoundCloud popups)
                 def _setup_popups():
                     try:
-                        core = form.browser.webview.CoreWebView2
-                        if core:
+                        # Try multiple paths depending on pywebview version
+                        core = None
+                        for attr_path in [
+                            lambda: form.browser.CoreWebView2,
+                            lambda: form.browser.webview.CoreWebView2,
+                            lambda: form.browser._webview.CoreWebView2,
+                        ]:
+                            try:
+                                core = attr_path()
+                                if core is not None:
+                                    break
+                            except Exception:
+                                continue
+
+                        if core is None:
+                            print("[Popup] Could not find CoreWebView2")
+                            return
+
+                        # Try to remove existing handler (pywebview adds one that blocks all popups)
+                        try:
                             core.NewWindowRequested -= form.browser.on_new_window_request
+                        except Exception:
+                            pass
 
-                            def _on_new_window(sender, args):
-                                uri = str(args.get_Uri())
-                                is_auth = any(d in uri for d in [
-                                    "accounts.google.com", "google.com", "appleid.apple.com", "apple.com",
-                                    "facebook.com", "fb.com", "soundcloud.com", "sndcdn.com"
-                                ])
+                        AUTH_DOMAINS = (
+                            "accounts.google.com", "google.com",
+                            "appleid.apple.com", "apple.com",
+                            "facebook.com", "fb.com",
+                            "soundcloud.com", "sndcdn.com"
+                        )
+
+                        def _on_new_window(sender, args):
+                            try:
+                                # Uri may be a property or getter depending on WebView2 version
+                                try:
+                                    uri = str(args.Uri)
+                                except Exception:
+                                    uri = str(args.get_Uri())
+
+                                is_auth = any(d in uri for d in AUTH_DOMAINS)
+
+                                # Handled may be a property or setter
+                                def _set_handled(val):
+                                    try:
+                                        args.Handled = val
+                                    except Exception:
+                                        try:
+                                            args.set_Handled(val)
+                                        except Exception:
+                                            pass
+
                                 if is_auth or not uri.startswith("http"):
-                                    args.set_Handled(False)  # Allows native popup window!
+                                    _set_handled(False)  # Allow native popup
                                 else:
-                                    args.set_Handled(True)
+                                    _set_handled(True)
                                     webbrowser.open(uri)
+                            except Exception as ex:
+                                print(f"[Popup] NewWindowRequested handler error: {ex}")
 
-                            core.NewWindowRequested += _on_new_window
+                        core.NewWindowRequested += _on_new_window
+                        print("[Popup] NewWindowRequested handler installed successfully")
                     except Exception as e:
                         print(f"[Popup Setup Error] {e}")
 

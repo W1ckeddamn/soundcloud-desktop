@@ -84,14 +84,31 @@ class DiscordRPCManager:
                     {"label": "Listen on SoundCloud", "url": track_url}
                 ]
 
+            try:
+                current_track_time_in_sec = float(current_sec) if current_sec is not None else 0.0
+            except (ValueError, TypeError):
+                current_track_time_in_sec = 0.0
+
+            try:
+                total_track_duration_in_sec = float(duration_sec) if duration_sec is not None else 0.0
+            except (ValueError, TypeError):
+                total_track_duration_in_sec = 0.0
+
+            has_valid_duration = (total_track_duration_in_sec > 0)
+
             if is_playing:
-                if duration_sec and duration_sec > 0:
-                    start_ts = int(now - current_sec)
-                    end_ts = int(start_ts + duration_sec)
+                if has_valid_duration:
+                    start_ts = int(now - current_track_time_in_sec)
+                    end_ts = int(start_ts + total_track_duration_in_sec)
                     payload["start"] = start_ts
                     payload["end"] = end_ts
+                    print(f"[Discord RPC] Listening timestamps (sec): current={current_track_time_in_sec}, duration={total_track_duration_in_sec}, start={start_ts}, end={end_ts}")
                 else:
                     payload["start"] = int(now)
+            else:
+                # When paused, no start/end timestamps so Discord does not keep counting
+                payload["start"] = None
+                payload["end"] = None
 
             try:
                 self.rpc.update(**payload)

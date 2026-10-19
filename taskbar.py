@@ -18,10 +18,23 @@ THB_FLAGS = 0x00000008
 
 THBF_ENABLED = 0x00000000
 THBF_DISABLED = 0x00000001
+THBF_NOBACKGROUND = 0x00000004
 
 TBPF_NOPROGRESS = 0
 TBPF_NORMAL = 2
 TBPF_PAUSED = 8
+
+# Register the TaskbarButtonCreated message — must call ThumbBarAddButtons ONLY after this
+_WM_TASKBARBUTTONCREATED = ctypes.windll.user32.RegisterWindowMessageW("TaskbarButtonCreated")
+# Allow TaskbarButtonCreated to be received by non-elevated windows
+try:
+    MSGFLT_ALLOW = 1
+    ctypes.windll.user32.ChangeWindowMessageFilterEx(
+        None, _WM_TASKBARBUTTONCREATED, MSGFLT_ALLOW, None
+    )
+except Exception:
+    pass
+
 
 class GUID(ctypes.Structure):
     _fields_ = [
@@ -31,7 +44,9 @@ class GUID(ctypes.Structure):
         ('Data4', wintypes.BYTE * 8)
     ]
 
+
 class THUMBBUTTON(ctypes.Structure):
+    _pack_ = 8  # pshpack8.h — matches Windows SDK layout
     _fields_ = [
         ('dwMask', wintypes.DWORD),
         ('iId', wintypes.UINT),
@@ -41,10 +56,12 @@ class THUMBBUTTON(ctypes.Structure):
         ('dwFlags', wintypes.DWORD)
     ]
 
+
 CLSID_TaskbarList = GUID(0x56FDF344, 0xFD6D, 0x11D0, (wintypes.BYTE * 8)(0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90))
 IID_ITaskbarList3 = GUID(0xEA1AFB91, 0x9E28, 0x4B86, (wintypes.BYTE * 8)(0x90, 0xE9, 0x9E, 0x9F, 0x8A, 0x5E, 0xEF, 0xAF))
 
 SUBCLASSPROC = WINFUNCTYPE(c_void_p, wintypes.HWND, c_uint, wintypes.WPARAM, wintypes.LPARAM, c_void_p, c_void_p)
+
 
 class TaskbarManager:
     def __init__(self, hwnd, on_command_callback, assets_dir=None):
@@ -56,6 +73,10 @@ class TaskbarManager:
         self.buttons_added = False
         self.icons = {}
         self.subclass_proc = None
+        # Pending state to apply once TaskbarButtonCreated fires
+        self._pending_state = None
+        # Cached last args for deferred add
+        self._last_update_args = (False, False, True, True)
 
         self._init_taskbar()
         self._load_icons()
@@ -72,18 +93,26 @@ class TaskbarManager:
                 byref(IID_ITaskbarList3), byref(self.taskbar)
             )
             if hr != 0 or not self.taskbar.value:
+                print(f"[Taskbar] CoCreateInstance failed hr=0x{hr & 0xFFFFFFFF:08X}")
                 self.taskbar = None
                 return
 
             vtable = ctypes.cast(self.taskbar, POINTER(POINTER(c_void_p))).contents
             # Index 3: HrInit
-            WINFUNCTYPE(c_long, c_void_p)(vtable[3])(self.taskbar)
+            hr_init = WINFUNCTYPE(c_long, c_void_p)(vtable[3])(self.taskbar)
+            print(f"[Taskbar] HrInit hr=0x{hr_init & 0xFFFFFFFF:08X}")
 
-            # Resolve function pointers
+            # Resolve function pointers by vtable index
+            # ITaskbarList:  3=HrInit, 4=AddTab, 5=DeleteTab, 6=ActivateTab, 7=SetActiveAlt
+            # ITaskbarList2: 8=MarkFullscreenWindow
+            # ITaskbarList3: 9=SetProgressValue, 10=SetProgressState, 11=RegisterTab,
+            #                12=UnregisterTab, 13=SetTabOrder, 14=SetTabActive,
+            #                15=ThumbBarAddButtons, 16=ThumbBarUpdateButtons, ...
             self._fn_set_progress_value = WINFUNCTYPE(c_long, c_void_p, wintypes.HWND, c_ulonglong, c_ulonglong)(vtable[9])
             self._fn_set_progress_state = WINFUNCTYPE(c_long, c_void_p, wintypes.HWND, c_uint)(vtable[10])
             self._fn_thumb_bar_add = WINFUNCTYPE(c_long, c_void_p, wintypes.HWND, c_uint, c_void_p)(vtable[15])
             self._fn_thumb_bar_update = WINFUNCTYPE(c_long, c_void_p, wintypes.HWND, c_uint, c_void_p)(vtable[16])
+            print("[Taskbar] COM initialized successfully")
         except Exception as e:
             print("[Taskbar] Init error:", e)
             self.taskbar = None
@@ -91,9 +120,10 @@ class TaskbarManager:
     def _load_icon_file(self, filename):
         path = os.path.join(self.thumbar_dir, filename)
         if not os.path.exists(path):
+            print(f"[Taskbar] Icon not found: {path}")
             return 0
         hicon = ctypes.windll.user32.LoadImageW(
-            None, path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE
+            None, path, IMAGE_ICON, 20, 20, LR_LOADFROMFILE
         )
         return hicon or 0
 
@@ -108,8 +138,18 @@ class TaskbarManager:
             "prev_disabled": self._load_icon_file("prev-disabled.ico"),
             "next_disabled": self._load_icon_file("next-disabled.ico"),
         }
+        print(f"[Taskbar] Icons loaded: { {k: bool(v) for k, v in self.icons.items()} }")
 
     def _setup_subclass(self):
+        # Allow TaskbarButtonCreated for this specific HWND
+        try:
+            MSGFLT_ALLOW = 1
+            ctypes.windll.user32.ChangeWindowMessageFilterEx(
+                self.hwnd, _WM_TASKBARBUTTONCREATED, MSGFLT_ALLOW, None
+            )
+        except Exception:
+            pass
+
         # Register global media keys on hwnd
         try:
             ctypes.windll.user32.RegisterHotKey(self.hwnd, 201, 0, VK_MEDIA_PREV_TRACK)
@@ -118,8 +158,17 @@ class TaskbarManager:
         except Exception:
             pass
 
+        wm_tbc = _WM_TASKBARBUTTONCREATED
+
         def _wnd_proc(hwnd, uMsg, wParam, lParam, uIdSubclass, dwRefData):
-            if uMsg == WM_COMMAND:
+            if uMsg == wm_tbc:
+                # TaskbarButtonCreated — now safe to add thumb buttons
+                print("[Taskbar] TaskbarButtonCreated received, adding buttons...")
+                self.buttons_added = False  # Reset so next update does Add, not Update
+                has_track, is_playing, can_prev, can_next = self._last_update_args
+                self._do_add_buttons(has_track, is_playing, can_prev, can_next)
+                return 0
+            elif uMsg == WM_COMMAND:
                 cmd_id = wParam & 0xFFFF
                 if cmd_id in (101, 102, 103) and self.on_command:
                     try:
@@ -140,6 +189,58 @@ class TaskbarManager:
 
         self.subclass_proc = SUBCLASSPROC(_wnd_proc)
         ctypes.windll.comctl32.SetWindowSubclass(self.hwnd, self.subclass_proc, 1001, 0)
+        print("[Taskbar] Window subclassed, waiting for TaskbarButtonCreated...")
+
+    def _build_button_array(self, has_track, is_playing, can_prev, can_next):
+        btn_array = (THUMBBUTTON * 3)()
+
+        # Button 101: Previous
+        btn_array[0].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS
+        btn_array[0].iId = 101
+        btn_array[0].szTip = "Previous Track"
+        if has_track and can_prev:
+            btn_array[0].hIcon = self.icons.get("prev") or 0
+            btn_array[0].dwFlags = THBF_ENABLED | THBF_NOBACKGROUND
+        else:
+            btn_array[0].hIcon = self.icons.get("prev_disabled") or self.icons.get("prev") or 0
+            btn_array[0].dwFlags = THBF_DISABLED | THBF_NOBACKGROUND
+
+        # Button 102: Play / Pause
+        btn_array[1].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS
+        btn_array[1].iId = 102
+        if is_playing:
+            btn_array[1].szTip = "Pause"
+            btn_array[1].hIcon = self.icons.get("pause") or 0
+        else:
+            btn_array[1].szTip = "Play"
+            btn_array[1].hIcon = self.icons.get("play") or 0
+        btn_array[1].dwFlags = (THBF_ENABLED if has_track else THBF_DISABLED) | THBF_NOBACKGROUND
+
+        # Button 103: Next
+        btn_array[2].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS
+        btn_array[2].iId = 103
+        btn_array[2].szTip = "Next Track"
+        if has_track and can_next:
+            btn_array[2].hIcon = self.icons.get("next") or 0
+            btn_array[2].dwFlags = THBF_ENABLED | THBF_NOBACKGROUND
+        else:
+            btn_array[2].hIcon = self.icons.get("next_disabled") or self.icons.get("next") or 0
+            btn_array[2].dwFlags = THBF_DISABLED | THBF_NOBACKGROUND
+
+        return btn_array
+
+    def _do_add_buttons(self, has_track, is_playing, can_prev, can_next):
+        if not self.taskbar:
+            return
+        try:
+            btn_array = self._build_button_array(has_track, is_playing, can_prev, can_next)
+            ptr = ctypes.cast(btn_array, c_void_p)
+            hr = self._fn_thumb_bar_add(self.taskbar, self.hwnd, 3, ptr)
+            print(f"[Taskbar] ThumbBarAddButtons hr=0x{hr & 0xFFFFFFFF:08X}")
+            if hr == 0:
+                self.buttons_added = True
+        except Exception as e:
+            print("[Taskbar] ThumbBarAddButtons error:", e)
 
     def destroy(self):
         try:
@@ -166,54 +267,22 @@ class TaskbarManager:
             pass
 
     def update_thumbar(self, has_track, is_playing, can_prev=True, can_next=True):
+        # Save latest state for deferred add after TaskbarButtonCreated
+        self._last_update_args = (has_track, is_playing, can_prev, can_next)
+
         if not self.taskbar:
             return
 
-        btn_array = (THUMBBUTTON * 3)()
-
-        # Button 101: Previous
-        btn_prev = btn_array[0]
-        btn_prev.dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS
-        btn_prev.iId = 101
-        btn_prev.szTip = "Previous Track"
-        if has_track and can_prev:
-            btn_prev.hIcon = self.icons.get("prev", 0)
-            btn_prev.dwFlags = THBF_ENABLED
-        else:
-            btn_prev.hIcon = self.icons.get("prev_disabled", 0) or self.icons.get("prev", 0)
-            btn_prev.dwFlags = THBF_DISABLED
-
-        # Button 102: Play / Pause
-        btn_play = btn_array[1]
-        btn_play.dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS
-        btn_play.iId = 102
-        if is_playing:
-            btn_play.szTip = "Pause"
-            btn_play.hIcon = self.icons.get("pause", 0)
-            btn_play.dwFlags = THBF_ENABLED if has_track else THBF_DISABLED
-        else:
-            btn_play.szTip = "Play"
-            btn_play.hIcon = self.icons.get("play", 0)
-            btn_play.dwFlags = THBF_ENABLED if has_track else THBF_DISABLED
-
-        # Button 103: Next
-        btn_next = btn_array[2]
-        btn_next.dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS
-        btn_next.iId = 103
-        btn_next.szTip = "Next Track"
-        if has_track and can_next:
-            btn_next.hIcon = self.icons.get("next", 0)
-            btn_next.dwFlags = THBF_ENABLED
-        else:
-            btn_next.hIcon = self.icons.get("next_disabled", 0) or self.icons.get("next", 0)
-            btn_next.dwFlags = THBF_DISABLED
+        if not self.buttons_added:
+            # Don't call Add yet — wait for TaskbarButtonCreated in WndProc
+            # (unless we already received it earlier and it was reset)
+            return
 
         try:
-            if not self.buttons_added:
-                hr = self._fn_thumb_bar_add(self.taskbar, self.hwnd, 3, byref(btn_array))
-                if hr == 0:
-                    self.buttons_added = True
-            else:
-                self._fn_thumb_bar_update(self.taskbar, self.hwnd, 3, byref(btn_array))
+            btn_array = self._build_button_array(has_track, is_playing, can_prev, can_next)
+            ptr = ctypes.cast(btn_array, c_void_p)
+            hr = self._fn_thumb_bar_update(self.taskbar, self.hwnd, 3, ptr)
+            if hr != 0:
+                print(f"[Taskbar] ThumbBarUpdateButtons hr=0x{hr & 0xFFFFFFFF:08X}")
         except Exception as e:
             print("[Taskbar] Update error:", e)
