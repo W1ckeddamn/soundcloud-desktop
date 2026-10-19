@@ -6,10 +6,12 @@ const discordRPC = require('./discord-rpc');
 // Set Windows AppUserModelId for taskbar grouping and thumbnail toolbar
 app.setAppUserModelId('com.soundcloud.desktop');
 
-// Command line switches for optimal audio playback and no throttling
+// Command line switches for optimal audio playback, security, and Google Sign-In compatibility
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
+// Mask automation signals (prevents Google from detecting embedded automation context)
+app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 
 const logFile = 'D:\\soundcloud-desktop\\launch.log';
 function log(msg) {
@@ -34,13 +36,12 @@ if (!isSingleInstance) {
   process.exit(0);
 }
 
-// User Agent matching standard Google Chrome on Windows 10/11
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-// Modern Firefox User Agent for Google OAuth to avoid "disallowed_useragent" / "insecure browser" restrictions
-const FIREFOX_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0';
+// Clean standard Chrome User-Agent matching modern desktop Chrome on Windows 10/11
+// Removing any Electron or custom token prevents Google from returning 'disallowed_useragent'
+const CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-// Set global user agent fallback so all webContents and popups use standard Chrome
-app.userAgentFallback = USER_AGENT;
+// Set global user agent fallback
+app.userAgentFallback = CHROME_USER_AGENT;
 
 let mainWindow = null;
 let tray = null;
@@ -325,7 +326,7 @@ function createWindow() {
 
   log(`Step 4: Loading SoundCloud URL`);
   mainWindow.loadURL('https://soundcloud.com/discover', {
-    userAgent: USER_AGENT
+    userAgent: CHROME_USER_AGENT
   });
   log(`Step 5: loadURL returned`);
 
@@ -345,7 +346,9 @@ function createWindow() {
           backgroundColor: '#121212',
           webPreferences: {
             nodeIntegration: false,
-            contextIsolation: true
+            contextIsolation: true,
+            sandbox: true,
+            webSecurity: true
           }
         }
       };
@@ -374,7 +377,9 @@ function createWindow() {
           backgroundColor: '#121212',
           webPreferences: {
             nodeIntegration: false,
-            contextIsolation: true
+            contextIsolation: true,
+            sandbox: true,
+            webSecurity: true
           }
         }
       };
@@ -392,15 +397,7 @@ function createWindow() {
       popupWin.setIcon(appIcon);
     } catch (e) {}
 
-    popupWin.webContents.setUserAgent(USER_AGENT);
-
-    popupWin.webContents.on('will-navigate', (event, url) => {
-      if (url.includes('accounts.google.com') || url.includes('google.com/signin')) {
-        popupWin.webContents.setUserAgent(FIREFOX_USER_AGENT);
-      } else {
-        popupWin.webContents.setUserAgent(USER_AGENT);
-      }
-    });
+    popupWin.webContents.setUserAgent(CHROME_USER_AGENT);
 
     popupWin.webContents.setWindowOpenHandler(({ url }) => {
       if (!url || url.startsWith('about:') || url.startsWith('javascript:') || url.startsWith('blob:') ||
@@ -694,11 +691,14 @@ app.on('before-quit', () => {
 app.whenReady().then(() => {
   log(`app.whenReady() resolved`);
 
-  // Strip Chromium botguard headers and set Firefox User-Agent for Google OAuth
+  // Ensure defaultSession uses clean standard Chrome User-Agent
+  session.defaultSession.setUserAgent(CHROME_USER_AGENT);
+
+  // Filter requests to remove any Electron / automation leaks
   session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
+    details.requestHeaders['User-Agent'] = CHROME_USER_AGENT;
     const url = details.url || '';
     if (url.includes('accounts.google.com') || url.includes('google.com/signin') || url.includes('google.com/oauth')) {
-      details.requestHeaders['User-Agent'] = FIREFOX_USER_AGENT;
       delete details.requestHeaders['Sec-Ch-Ua'];
       delete details.requestHeaders['Sec-Ch-Ua-Mobile'];
       delete details.requestHeaders['Sec-Ch-Ua-Platform'];
