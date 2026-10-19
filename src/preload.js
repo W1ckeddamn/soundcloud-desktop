@@ -40,7 +40,16 @@ function getPlayerState() {
   const durationEl = document.querySelector('.playbackTimeline__duration > span[aria-hidden="true"], .playbackTimeline__duration');
   const progressWrapper = document.querySelector('.playbackTimeline__progressWrapper');
 
-  const isPlaying = playBtn ? (playBtn.classList.contains('playing') || (playBtn.title && (playBtn.title.toLowerCase().includes('pause') || playBtn.title.toLowerCase().includes('приостанов')))) : false;
+  let isPlaying = false;
+  if (typeof navigator !== 'undefined' && navigator.mediaSession && navigator.mediaSession.playbackState === 'playing') {
+    isPlaying = true;
+  } else if (playBtn) {
+    const titleAttr = (playBtn.getAttribute('title') || '').toLowerCase();
+    const ariaLabel = (playBtn.getAttribute('aria-label') || '').toLowerCase();
+    const isPauseBtn = titleAttr.includes('pause') || titleAttr.includes('приостанов') ||
+                       ariaLabel.includes('pause') || ariaLabel.includes('приостанов');
+    isPlaying = playBtn.classList.contains('playing') || isPauseBtn;
+  }
   const isDisabled = playBtn ? playBtn.classList.contains('disabled') : true;
 
   // Extract metadata
@@ -57,8 +66,13 @@ function getPlayerState() {
     }
   }
 
+  // Extract clean title without "Current track: " prefix or duplicate lines
   if (!title && titleEl) {
-    title = (titleEl.innerText || titleEl.getAttribute('title') || '').trim();
+    const rawTitle = (titleEl.innerText || titleEl.getAttribute('title') || '').trim();
+    // Split by newlines or strip "Current track:"
+    const lines = rawTitle.split('\n').map(s => s.trim()).filter(Boolean);
+    const cleaned = (lines[0] || rawTitle).replace(/^Current track:\s*/i, '').trim();
+    title = cleaned;
   }
   if (!artist && artistEl) {
     artist = (artistEl.innerText || artistEl.getAttribute('title') || '').trim();
@@ -97,24 +111,45 @@ function getPlayerState() {
     if (max > 0) progress = Math.min(1, Math.max(0, now / max));
   }
 
-  const timePassed = timePassedEl ? timePassedEl.innerText.trim() : '';
-  const duration = durationEl ? durationEl.innerText.trim() : '';
-
-  // Parse time format ("01:23", "01:23:45", "-00:45") into seconds
-  function parseSeconds(str) {
-    if (!str || typeof str !== 'string') return 0;
-    const clean = str.replace(/^-/, '').trim();
-    const parts = clean.split(':').map(Number);
-    if (parts.some(isNaN)) return 0;
-    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    if (parts.length === 2) return parts[0] * 60 + parts[1];
-    return parts[0] || 0;
+  // Extract clean time strings. If span[aria-hidden="true"] exists, use its textContent; otherwise fallback.
+  function extractTimeText(el) {
+    if (!el) return '';
+    const span = el.querySelector('span[aria-hidden="true"]');
+    if (span) {
+      return span.innerText || span.textContent || '';
+    }
+    return el.innerText || el.textContent || '';
   }
 
-  const currentSeconds = parseSeconds(timePassed);
-  let durationSeconds = parseSeconds(duration);
-  if (duration.startsWith('-')) {
-    durationSeconds = currentSeconds + durationSeconds;
+  const rawTimePassed = extractTimeText(timePassedEl).trim();
+  const rawDuration = extractTimeText(durationEl).trim();
+
+  // Parse time format ("01:23", "01:23:45", "-00:45") into seconds, ignoring any surrounding text
+  function parseSeconds(str) {
+    if (!str || typeof str !== 'string') return 0;
+    // Match any sequence like -?(\d+):(\d+)(?::(\d+))?
+    const match = str.match(/(-)?\b(\d+):(\d{2})(?::(\d{2}))?\b/);
+    if (!match) return 0;
+    const isNegative = Boolean(match[1]);
+    const p1 = Number(match[2]);
+    const p2 = Number(match[3]);
+    const p3 = match[4] !== undefined ? Number(match[4]) : null;
+
+    let sec = 0;
+    if (p3 !== null) {
+      sec = p1 * 3600 + p2 * 60 + p3;
+    } else {
+      sec = p1 * 60 + p2;
+    }
+    return isNegative ? -sec : sec;
+  }
+
+  const currentSeconds = Math.max(0, parseSeconds(rawTimePassed));
+  let durationSeconds = parseSeconds(rawDuration);
+  if (rawDuration.includes('-') && durationSeconds <= 0) {
+    durationSeconds = currentSeconds + Math.abs(durationSeconds);
+  } else {
+    durationSeconds = Math.max(0, durationSeconds);
   }
 
   const hasTrack = !isDisabled || Boolean(title);
@@ -130,8 +165,8 @@ function getPlayerState() {
     artwork,
     trackUrl,
     progress,
-    timePassed,
-    duration,
+    timePassed: rawTimePassed,
+    duration: rawDuration,
     currentSeconds,
     durationSeconds,
     canPrev,

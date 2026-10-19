@@ -1,4 +1,10 @@
 const DiscordRPC = require('discord-rpc');
+const fs = require('fs');
+
+const logFile = 'D:\\soundcloud-desktop\\launch.log';
+function log(msg) {
+  try { fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${msg}\n`); } catch (e) {}
+}
 
 // Official PreMiD / Community SoundCloud Discord Application
 const CLIENT_ID = '802958833214423081';
@@ -75,8 +81,14 @@ function setActivity(activity) {
       instance: false
     };
 
+    // Support both wrapper conventions (startTimestamp/endTimestamp) and nested timestamps
     if (activity.timestamps) {
       rawActivity.timestamps = activity.timestamps;
+    } else if (activity.startTimestamp || activity.endTimestamp) {
+      rawActivity.timestamps = {
+        start: activity.startTimestamp,
+        end: activity.endTimestamp
+      };
     }
 
     if (activity.assets) {
@@ -87,11 +99,21 @@ function setActivity(activity) {
       rawActivity.buttons = activity.buttons;
     }
 
+    log(`[Discord RPC] Sending SET_ACTIVITY: ${JSON.stringify(rawActivity)}`);
+
     rpcClient.request('SET_ACTIVITY', {
       pid: process.pid,
       activity: rawActivity
-    }).catch(() => {});
-  } catch (err) {}
+    }).then((res) => {
+      log(`[Discord RPC] SET_ACTIVITY success: ${JSON.stringify(res)}`);
+    }).catch((err) => {
+      log(`[Discord RPC] SET_ACTIVITY error: ${err ? (err.message || JSON.stringify(err)) : err}`);
+      console.warn('[Discord RPC] SET_ACTIVITY error:', err ? err.message : err);
+    });
+  } catch (err) {
+    log(`[Discord RPC] setActivity exception: ${err ? err.stack : err}`);
+    console.warn('[Discord RPC] setActivity exception:', err);
+  }
 }
 
 function clearActivity() {
@@ -156,21 +178,41 @@ function updateState(state) {
     ];
   }
 
+  const currentTrackTimeInSeconds = Number(state.currentSeconds);
+  const totalTrackDurationInSeconds = Number(state.durationSeconds);
+  const hasValidDuration = Number.isFinite(totalTrackDurationInSeconds) && totalTrackDurationInSeconds > 0;
+  const validCurrentSeconds = (Number.isFinite(currentTrackTimeInSeconds) && currentTrackTimeInSeconds >= 0) ? currentTrackTimeInSeconds : 0;
+
   if (state.isPlaying) {
-    // Discord smoothly animates elapsed/remaining time when start and end timestamps are provided
-    if (state.durationSeconds && state.durationSeconds > 0) {
-      const elapsedMs = (state.currentSeconds || 0) * 1000;
-      const startMs = now - elapsedMs;
-      const endMs = startMs + state.durationSeconds * 1000;
+    if (hasValidDuration) {
+      const start = Math.round(now - (validCurrentSeconds * 1000));
+      const end = Math.round(start + (totalTrackDurationInSeconds * 1000));
+
+      console.log('[Discord RPC] Listening timestamps (ms):', {
+        currentTrackTimeInSeconds: validCurrentSeconds,
+        totalTrackDurationInSeconds,
+        start,
+        end
+      });
+
+      activity.startTimestamp = start;
+      activity.endTimestamp = end;
       activity.timestamps = {
-        start: Math.round(startMs),
-        end: Math.round(endMs)
+        start,
+        end
       };
     } else {
+      console.log('[Discord RPC] Duration not available, elapsed only. durationSeconds =', state.durationSeconds);
+      activity.startTimestamp = now;
       activity.timestamps = {
-        start: Math.round(now)
+        start: now
       };
     }
+  } else {
+    // When paused, do not pass timestamps so Discord stops the timer
+    delete activity.startTimestamp;
+    delete activity.endTimestamp;
+    delete activity.timestamps;
   }
 
   setActivity(activity);

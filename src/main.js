@@ -232,6 +232,7 @@ function updateTray() {
       click: (menuItem) => {
         appSettings.closeToTray = menuItem.checked;
         saveSettings(appSettings);
+        updateTray();
       }
     },
     {
@@ -245,6 +246,7 @@ function updateTray() {
         if (menuItem.checked) {
           discordRPC.updateState(currentState);
         }
+        updateTray();
       }
     },
     {
@@ -253,6 +255,7 @@ function updateTray() {
       checked: app.getLoginItemSettings().openAtLogin,
       click: (menuItem) => {
         app.setLoginItemSettings({ openAtLogin: menuItem.checked });
+        updateTray();
       }
     },
     { type: 'separator' },
@@ -643,6 +646,7 @@ function registerMediaShortcuts() {
 // IPC handler for player state updates from preload
 ipcMain.on('player:state', (event, state) => {
   currentState = state;
+  log(`[player:state] hasTrack=${state.hasTrack}, isPlaying=${state.isPlaying}, title=${state.title}, timePassed=${state.timePassed}, duration=${state.duration}, currentSec=${state.currentSeconds}, durationSec=${state.durationSeconds}`);
 
   // Update window title with now playing
   if (mainWindow && !mainWindow.isDestroyed()) {
