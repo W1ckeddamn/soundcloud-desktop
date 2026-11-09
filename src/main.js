@@ -1,4 +1,23 @@
-const { app, BrowserWindow, Menu, Tray, nativeImage, shell, ipcMain, globalShortcut, session } = require('electron');
+const electron = require('electron');
+
+// Handle case where process is started with ELECTRON_RUN_AS_NODE=1 or via plain node
+// In this mode, require('electron') returns the electron binary path string instead of the API object
+if (!electron || typeof electron === 'string' || !electron.app) {
+  const { spawn } = require('child_process');
+  const path = require('path');
+  const electronBinary = typeof electron === 'string' ? electron : require('electron');
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
+  const child = spawn(electronBinary, [path.join(__dirname, '..')], {
+    env,
+    stdio: 'inherit',
+    windowsHide: false
+  });
+  child.on('close', (code) => process.exit(code || 0));
+  return;
+}
+
+const { app, BrowserWindow, Menu, Tray, nativeImage, shell, ipcMain, globalShortcut, session, screen } = electron;
 const path = require('path');
 const fs = require('fs');
 const discordRPC = require('./discord-rpc');
@@ -13,25 +32,30 @@ app.commandLine.appendSwitch('disable-renderer-backgrounding');
 // Mask automation signals (prevents Google from detecting embedded automation context)
 app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 
-const logFile = 'D:\\soundcloud-desktop\\launch.log';
+const logFile = path.join(__dirname, '..', 'launch.log');
 function log(msg) {
-  try { fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${msg}\n`); } catch (e) {}
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  try {
+    if (fs.existsSync(logFile) && fs.statSync(logFile).size > 5 * 1024 * 1024) {
+      fs.writeFileSync(logFile, `[${new Date().toISOString()}] [LOG ROTATED]\n`);
+    }
+    fs.appendFile(logFile, line, () => {});
+  } catch (e) {}
+  if (process.env.DEBUG_SOUNDCLOUD) {
+    console.log(`[SoundCloud Desktop] ${msg}`);
+  }
 }
-log(`=== App starting ===`);
-log(`argv: ${JSON.stringify(process.argv)}`);
 
 process.on('uncaughtException', (err) => {
-  log(`uncaughtException: ${err.stack || err}`);
+  console.error('uncaughtException:', err.stack || err);
 });
 process.on('unhandledRejection', (err) => {
-  log(`unhandledRejection: ${err.stack || err}`);
+  console.error('unhandledRejection:', err.stack || err);
 });
 
 // Ensure single instance
 const isSingleInstance = app.requestSingleInstanceLock();
-log(`isSingleInstance result: ${isSingleInstance}`);
 if (!isSingleInstance) {
-  log(`Exiting because isSingleInstance is false`);
   app.quit();
   process.exit(0);
 }
@@ -47,6 +71,40 @@ let mainWindow = null;
 let tray = null;
 let isQuitting = false;
 let thumbarInitialized = false;
+let isHiddenInTray = false;
+
+function hideWindowToTray() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  isHiddenInTray = true;
+  mainWindow.setSkipTaskbar(true);
+  mainWindow.minimize();
+  updateTray(true);
+  log('[Window] Hidden to tray (skipTaskbar + minimize)');
+}
+
+function showWindowFromTray() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  isHiddenInTray = false;
+  mainWindow.setSkipTaskbar(false);
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  mainWindow.show();
+  mainWindow.focus();
+  updateTray(true);
+  log('[Window] Restored from tray');
+  refreshTaskbarState();
+  setTimeout(refreshTaskbarState, 200);
+}
+
+function toggleWindowFromTray() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (isHiddenInTray || mainWindow.isMinimized() || !mainWindow.isVisible()) {
+    showWindowFromTray();
+  } else {
+    hideWindowToTray();
+  }
+}
 
 // Settings path
 const SETTINGS_FILE = path.join(app.getPath('userData'), 'settings.json');
@@ -75,6 +133,28 @@ function saveSettings(settings) {
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
   } catch (err) {
     console.error('Failed to save settings:', err);
+  }
+}
+
+function isBoundsOnScreen(bounds) {
+  if (!bounds || typeof bounds.x !== 'number' || typeof bounds.y !== 'number' ||
+      typeof bounds.width !== 'number' || typeof bounds.height !== 'number' ||
+      bounds.width < 400 || bounds.height < 400) {
+    return false;
+  }
+  try {
+    const displays = screen.getAllDisplays();
+    return displays.some(display => {
+      const { x, y, width, height } = display.bounds;
+      return (
+        bounds.x < x + width &&
+        bounds.x + bounds.width > x &&
+        bounds.y < y + height &&
+        bounds.y + bounds.height > y
+      );
+    });
+  } catch (e) {
+    return bounds.width >= 400 && bounds.height >= 400;
   }
 }
 
@@ -112,6 +192,7 @@ const thumbarIcons = {
 const appIcon = nativeImage.createFromPath(path.join(ASSETS_PATH, 'icon.ico'));
 const trayIcon = nativeImage.createFromPath(path.join(ASSETS_PATH, 'icon.ico'));
 
+
 // Send player command to renderer
 function sendPlayerCommand(cmd, arg) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -120,10 +201,16 @@ function sendPlayerCommand(cmd, arg) {
 }
 
 // Update Windows Taskbar Thumbnail Toolbar (ThumbarButtons)
-function updateThumbar() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
+let lastThumbarKey = '';
+function updateThumbar(force = false) {
+  if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible() || isHiddenInTray) return;
 
   const { isPlaying, hasTrack, canNext, canPrev } = currentState;
+  const thumbarKey = `${isPlaying}_${hasTrack}_${canNext}_${canPrev}`;
+  if (!force && thumbarInitialized && thumbarKey === lastThumbarKey) {
+    return;
+  }
+
   const playPauseTooltip = isPlaying ? 'Pause' : 'Play';
   const playPauseIcon = isPlaying ? thumbarIcons.pause : thumbarIcons.play;
 
@@ -162,10 +249,31 @@ function updateThumbar() {
     const success = mainWindow.setThumbarButtons(buttons);
     if (success) {
       thumbarInitialized = true;
+      lastThumbarKey = thumbarKey;
+      log(`[Thumbar] setThumbarButtons succeeded (${thumbarKey})`);
+    } else {
+      log(`[Thumbar] setThumbarButtons returned false, scheduling retry`);
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
+          const retrySuccess = mainWindow.setThumbarButtons(buttons);
+          if (retrySuccess) {
+            thumbarInitialized = true;
+            lastThumbarKey = thumbarKey;
+            log(`[Thumbar] Retry setThumbarButtons succeeded`);
+          }
+        }
+      }, 200);
     }
   } catch (err) {
-    console.error('Error setting thumbar buttons:', err);
+    log(`[Thumbar] Error setting thumbar buttons: ${err.message}`);
   }
+}
+
+function refreshTaskbarState() {
+  if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) return;
+  lastThumbarKey = '';
+  updateThumbar(true);
+  updateProgressBar();
 }
 
 // Update Windows Taskbar Progress Bar
@@ -182,7 +290,8 @@ function updateProgressBar() {
 }
 
 // Update System Tray Menu and Tooltip
-function updateTray() {
+let lastTrayKey = '';
+function updateTray(force = false) {
   if (!tray) return;
 
   const trackLabel = currentState.title
@@ -190,6 +299,14 @@ function updateTray() {
     : 'SoundCloud Desktop';
 
   tray.setToolTip(trackLabel);
+
+  const isWinVisible = Boolean(mainWindow && !mainWindow.isDestroyed() && !isHiddenInTray && !mainWindow.isMinimized() && mainWindow.isVisible());
+  const trayKey = `${currentState.title}_${currentState.artist}_${currentState.isPlaying}_${currentState.hasTrack}_${currentState.canNext}_${currentState.canPrev}_${appSettings.closeToTray}_${appSettings.minimizeToTray}_${appSettings.discordRPC}_${isWinVisible}`;
+
+  if (!force && trayKey === lastTrayKey) {
+    return;
+  }
+  lastTrayKey = trayKey;
 
   const contextMenu = Menu.buildFromTemplate([
     {
@@ -215,15 +332,9 @@ function updateTray() {
     },
     { type: 'separator' },
     {
-      label: mainWindow && mainWindow.isVisible() ? 'Hide to Tray' : 'Show SoundCloud',
+      label: isWinVisible ? 'Hide to Tray' : 'Show SoundCloud',
       click: () => {
-        if (!mainWindow) return;
-        if (mainWindow.isVisible()) {
-          mainWindow.hide();
-        } else {
-          mainWindow.show();
-          mainWindow.focus();
-        }
+        toggleWindowFromTray();
       }
     },
     {
@@ -233,7 +344,17 @@ function updateTray() {
       click: (menuItem) => {
         appSettings.closeToTray = menuItem.checked;
         saveSettings(appSettings);
-        updateTray();
+        updateTray(true);
+      }
+    },
+    {
+      label: 'Minimize to Tray',
+      type: 'checkbox',
+      checked: Boolean(appSettings.minimizeToTray),
+      click: (menuItem) => {
+        appSettings.minimizeToTray = menuItem.checked;
+        saveSettings(appSettings);
+        updateTray(true);
       }
     },
     {
@@ -247,7 +368,7 @@ function updateTray() {
         if (menuItem.checked) {
           discordRPC.updateState(currentState);
         }
-        updateTray();
+        updateTray(true);
       }
     },
     {
@@ -256,7 +377,7 @@ function updateTray() {
       checked: app.getLoginItemSettings().openAtLogin,
       click: (menuItem) => {
         app.setLoginItemSettings({ openAtLogin: menuItem.checked });
-        updateTray();
+        updateTray(true);
       }
     },
     { type: 'separator' },
@@ -275,13 +396,8 @@ function updateTray() {
 function createWindow() {
   log(`createWindow() called`);
   const bounds = appSettings.windowBounds || { width: 1280, height: 860 };
-  const isValidBounds = bounds &&
-    typeof bounds.x === 'number' && typeof bounds.y === 'number' &&
-    bounds.x >= 0 && bounds.y >= 0 &&
-    typeof bounds.width === 'number' && bounds.width >= 400 &&
-    typeof bounds.height === 'number' && bounds.height >= 400;
+  const isValidBounds = isBoundsOnScreen(bounds);
 
-  log(`Step 1: Instantiating BrowserWindow, icon empty: ${appIcon ? appIcon.isEmpty() : 'null'}`);
   mainWindow = new BrowserWindow({
     x: isValidBounds ? bounds.x : undefined,
     y: isValidBounds ? bounds.y : undefined,
@@ -302,7 +418,6 @@ function createWindow() {
       spellcheck: false
     }
   });
-  log(`Step 2: BrowserWindow instantiated successfully`);
 
   if (!isValidBounds) {
     mainWindow.center();
@@ -312,16 +427,18 @@ function createWindow() {
     mainWindow.maximize();
   }
 
+  // Prevent page title changes from overriding desktop client window title
+  mainWindow.on('page-title-updated', (event) => {
+    event.preventDefault();
+  });
+
   mainWindow.show();
   mainWindow.focus();
-  log(`Step 3: mainWindow shown and focused`);
 
   // Update thumbar when window is ready
   mainWindow.once('ready-to-show', () => {
     log(`mainWindow ready-to-show fired`);
-    updateThumbar();
-    setTimeout(updateThumbar, 1000);
-    setTimeout(updateThumbar, 3000);
+    setTimeout(refreshTaskbarState, 300);
   });
 
   log(`Step 4: Loading SoundCloud URL`);
@@ -484,35 +601,69 @@ function createWindow() {
     contextMenu.popup();
   });
 
-  // Save window position and size on move or resize
+  // Save window position and size on move or resize (debounced to prevent disk thrashing)
+  let saveBoundsTimer = null;
   const saveBounds = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
-    if (mainWindow.isVisible() && !mainWindow.isMinimized() && !mainWindow.isMaximized()) {
-      const b = mainWindow.getBounds();
-      if (b.x >= 0 && b.y >= 0 && b.width >= 400 && b.height >= 400) {
-        appSettings.windowBounds = b;
+    if (saveBoundsTimer) clearTimeout(saveBoundsTimer);
+    saveBoundsTimer = setTimeout(() => {
+      saveBoundsTimer = null;
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (mainWindow.isVisible() && !mainWindow.isMinimized() && !mainWindow.isMaximized()) {
+        const b = mainWindow.getBounds();
+        if (isBoundsOnScreen(b)) {
+          appSettings.windowBounds = b;
+        }
       }
-    }
-    appSettings.isMaximized = mainWindow.isMaximized();
-    saveSettings(appSettings);
+      appSettings.isMaximized = mainWindow.isMaximized();
+      saveSettings(appSettings);
+    }, 500);
   };
 
   mainWindow.on('resize', saveBounds);
   mainWindow.on('move', saveBounds);
 
+  // Minimize to tray logic
+  mainWindow.on('minimize', (event) => {
+    if (appSettings.minimizeToTray) {
+      event.preventDefault();
+      hideWindowToTray();
+    }
+  });
+
   // Close to tray logic
   mainWindow.on('close', (event) => {
     if (!isQuitting && appSettings.closeToTray) {
       event.preventDefault();
-      mainWindow.hide();
-      updateTray();
+      hideWindowToTray();
     } else {
       mainWindow = null;
     }
   });
 
+  // When window is restored from minimized or tray, refresh taskbar state
+  mainWindow.on('restore', () => {
+    if (isHiddenInTray) {
+      isHiddenInTray = false;
+      mainWindow.setSkipTaskbar(false);
+      updateTray(true);
+    }
+    log('[Window] Restored: restoring thumbnail toolbar buttons');
+    refreshTaskbarState();
+    setTimeout(refreshTaskbarState, 200);
+  });
+
+  mainWindow.on('show', () => {
+    log('[Window] Shown: refreshing taskbar state');
+    refreshTaskbarState();
+    setTimeout(refreshTaskbarState, 200);
+  });
+
   mainWindow.on('focus', () => {
-    if (!thumbarInitialized) updateThumbar();
+    if (!thumbarInitialized && !isHiddenInTray) {
+      log('[Window] Focus: thumbnail toolbar not initialized, refreshing');
+      refreshTaskbarState();
+    }
   });
 
   // Create Application Menu
@@ -523,7 +674,7 @@ function createWindow() {
         {
           label: 'Hide to Tray',
           accelerator: 'CmdOrCtrl+W',
-          click: () => mainWindow.hide()
+          click: () => hideWindowToTray()
         },
         { type: 'separator' },
         {
@@ -615,14 +766,7 @@ function createTray() {
     updateTray();
 
     tray.on('click', () => {
-      if (!mainWindow) return;
-      if (mainWindow.isVisible()) {
-        mainWindow.hide();
-      } else {
-        mainWindow.show();
-        mainWindow.focus();
-      }
-      updateTray();
+      toggleWindowFromTray();
     });
   } catch (err) {
     console.warn('Tray creation warning:', err);
@@ -641,9 +785,17 @@ function registerMediaShortcuts() {
 }
 
 // IPC handler for player state updates from preload
+let lastLoggedTitle = '';
+let lastLoggedPlaying = null;
+
 ipcMain.on('player:state', (event, state) => {
   currentState = state;
-  log(`[player:state] hasTrack=${state.hasTrack}, isPlaying=${state.isPlaying}, title=${state.title}, timePassed=${state.timePassed}, duration=${state.duration}, currentSec=${state.currentSeconds}, durationSec=${state.durationSeconds}`);
+
+  if (state.title !== lastLoggedTitle || state.isPlaying !== lastLoggedPlaying) {
+    lastLoggedTitle = state.title;
+    lastLoggedPlaying = state.isPlaying;
+    log(`[player:state] isPlaying=${state.isPlaying}, title="${state.title}", artist="${state.artist}"`);
+  }
 
   // Update window title with now playing
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -662,10 +814,8 @@ ipcMain.on('player:state', (event, state) => {
 
 // Second instance focus
 app.on('second-instance', () => {
-  if (mainWindow) {
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    if (!mainWindow.isVisible()) mainWindow.show();
-    mainWindow.focus();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    showWindowFromTray();
     mainWindow.flashFrame(true);
   }
 });
@@ -674,6 +824,7 @@ app.on('second-instance', () => {
 app.on('before-quit', () => {
   log(`[EVENT] app before-quit fired, isQuitting=${isQuitting}`);
   isQuitting = true;
+  try { discordRPC.destroy(); } catch (e) {}
   if (tray) {
     try { tray.destroy(); } catch (e) {}
     tray = null;
@@ -682,10 +833,6 @@ app.on('before-quit', () => {
     try { mainWindow.destroy(); } catch (e) {}
     mainWindow = null;
   }
-  setTimeout(() => {
-    log(`[EVENT] forcing process.exit(0) from before-quit timeout`);
-    process.exit(0);
-  }, 150);
 });
 
 app.whenReady().then(() => {
@@ -739,8 +886,7 @@ app.whenReady().then(() => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
     } else if (mainWindow) {
-      mainWindow.show();
-      mainWindow.focus();
+      showWindowFromTray();
     }
   });
 });
@@ -749,7 +895,6 @@ app.on('will-quit', () => {
   log(`[EVENT] app will-quit fired`);
   try { discordRPC.destroy(); } catch (e) {}
   globalShortcut.unregisterAll();
-  process.exit(0);
 });
 
 app.on('quit', (e, code) => {

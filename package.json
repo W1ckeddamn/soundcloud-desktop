@@ -1,6 +1,6 @@
 {
   "name": "soundcloud-desktop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "SoundCloud Desktop Application with Windows Taskbar Thumbnail Toolbar Media Controls",
   "main": "src/main.js",
   "scripts": {

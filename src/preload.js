@@ -41,7 +41,10 @@ function getPlayerState() {
   const progressWrapper = document.querySelector('.playbackTimeline__progressWrapper');
 
   let isPlaying = false;
-  if (typeof navigator !== 'undefined' && navigator.mediaSession && navigator.mediaSession.playbackState === 'playing') {
+  const audio = document.querySelector('audio');
+  if (audio && !audio.paused && !audio.ended && audio.currentTime > 0) {
+    isPlaying = true;
+  } else if (typeof navigator !== 'undefined' && navigator.mediaSession && navigator.mediaSession.playbackState === 'playing') {
     isPlaying = true;
   } else if (playBtn) {
     const titleAttr = (playBtn.getAttribute('title') || '').toLowerCase();
@@ -69,11 +72,13 @@ function getPlayerState() {
   // Extract clean title without "Current track: " prefix or duplicate lines
   if (!title && titleEl) {
     const rawTitle = (titleEl.innerText || titleEl.getAttribute('title') || '').trim();
-    // Split by newlines or strip "Current track:"
-    const lines = rawTitle.split('\n').map(s => s.trim()).filter(Boolean);
-    const cleaned = (lines[0] || rawTitle).replace(/^Current track:\s*/i, '').trim();
-    title = cleaned;
+    title = rawTitle;
   }
+  if (title) {
+    const lines = title.split('\n').map(s => s.trim()).filter(Boolean);
+    title = (lines[0] || title).replace(/^Current track:\s*/i, '').trim();
+  }
+
   if (!artist && artistEl) {
     artist = (artistEl.innerText || artistEl.getAttribute('title') || '').trim();
   }
@@ -91,9 +96,9 @@ function getPlayerState() {
     }
   }
 
-  // Upgrade SoundCloud thumbnail to high-res (500x500)
-  if (artwork && artwork.includes('-t50x50.')) {
-    artwork = artwork.replace('-t50x50.', '-t500x500.');
+  // Upgrade SoundCloud thumbnail (-t50x50, -t80x80, -t120x120, -t200x200, -large) to high-res (500x500)
+  if (artwork) {
+    artwork = artwork.replace(/-(?:t\d+x\d+|large)(\.[a-z0-9]+)$/i, '-t500x500$1');
   }
 
   // Extract track URL
@@ -197,34 +202,45 @@ function checkState() {
   }
 }
 
+// Throttled check for MutationObserver to avoid excessive CPU usage
+let checkScheduled = false;
+function scheduleCheckState() {
+  if (checkScheduled) return;
+  checkScheduled = true;
+  requestAnimationFrame(() => {
+    checkScheduled = false;
+    checkState();
+  });
+}
+
 // Handle playback commands from main process
 ipcRenderer.on('player:command', (event, cmd, arg) => {
   try {
+    const playBtn = document.querySelector('.playControl, .playControls__play');
+    const isCurrentlyPlaying = playBtn ? playBtn.classList.contains('playing') : lastState.isPlaying;
+
     switch (cmd) {
       case 'togglePlay': {
-        const playBtn = document.querySelector('.playControl, .playControls__play');
         if (playBtn) {
           playBtn.click();
         } else if (mediaSessionHandlers.play || mediaSessionHandlers.pause) {
-          if (lastState.isPlaying && mediaSessionHandlers.pause) mediaSessionHandlers.pause();
-          else if (!lastState.isPlaying && mediaSessionHandlers.play) mediaSessionHandlers.play();
+          if (isCurrentlyPlaying && mediaSessionHandlers.pause) mediaSessionHandlers.pause();
+          else if (!isCurrentlyPlaying && mediaSessionHandlers.play) mediaSessionHandlers.play();
         } else {
           // Space key fallback
-          window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space', keyCode: 32, which: 32, bubbles: true }));
+          document.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space', key: ' ', keyCode: 32, which: 32, bubbles: true }));
         }
         break;
       }
       case 'play': {
-        if (!lastState.isPlaying) {
-          const playBtn = document.querySelector('.playControl, .playControls__play');
+        if (!isCurrentlyPlaying) {
           if (playBtn) playBtn.click();
           else if (mediaSessionHandlers.play) mediaSessionHandlers.play();
         }
         break;
       }
       case 'pause': {
-        if (lastState.isPlaying) {
-          const playBtn = document.querySelector('.playControl, .playControls__play');
+        if (isCurrentlyPlaying) {
           if (playBtn) playBtn.click();
           else if (mediaSessionHandlers.pause) mediaSessionHandlers.pause();
         }
@@ -238,7 +254,7 @@ ipcRenderer.on('player:command', (event, cmd, arg) => {
           mediaSessionHandlers.nexttrack();
         } else {
           // Shift + ArrowRight fallback
-          window.dispatchEvent(new KeyboardEvent('keydown', { code: 'ArrowRight', keyCode: 39, which: 39, shiftKey: true, bubbles: true }));
+          document.dispatchEvent(new KeyboardEvent('keydown', { code: 'ArrowRight', key: 'ArrowRight', keyCode: 39, which: 39, shiftKey: true, bubbles: true }));
         }
         break;
       }
@@ -250,7 +266,7 @@ ipcRenderer.on('player:command', (event, cmd, arg) => {
           mediaSessionHandlers.previoustrack();
         } else {
           // Shift + ArrowLeft fallback
-          window.dispatchEvent(new KeyboardEvent('keydown', { code: 'ArrowLeft', keyCode: 37, which: 37, shiftKey: true, bubbles: true }));
+          document.dispatchEvent(new KeyboardEvent('keydown', { code: 'ArrowLeft', key: 'ArrowLeft', keyCode: 37, which: 37, shiftKey: true, bubbles: true }));
         }
         break;
       }
@@ -273,13 +289,16 @@ ipcRenderer.on('player:command', (event, cmd, arg) => {
 });
 
 // Safely dismiss cookie banner and remove dark filter
+let oneTrustHandled = false;
 function removeOneTrust() {
+  if (oneTrustHandled) return;
   try {
     const cookieBtn = document.querySelector('#onetrust-accept-btn-handler');
     if (cookieBtn) {
       cookieBtn.click();
+      oneTrustHandled = true;
     }
-    const filter = document.querySelector('.onetrust-pc-dark-filter');
+    const filter = document.querySelector('.onetrust-pc-dark-filter, div[class*="onetrust-pc-dark-filter"]');
     if (filter) {
       filter.remove();
     }
@@ -293,9 +312,9 @@ function removeOneTrust() {
 window.addEventListener('DOMContentLoaded', () => {
   removeOneTrust();
 
-  // Setup MutationObserver on document body
+  // Setup MutationObserver on document body with throttled checkState
   const observer = new MutationObserver(() => {
-    checkState();
+    scheduleCheckState();
     removeOneTrust();
   });
 
@@ -341,5 +360,5 @@ window.addEventListener('DOMContentLoaded', () => {
   document.head.appendChild(style);
 });
 
-// Periodic check interval
-setInterval(checkState, 250);
+// Periodic check interval (500ms)
+setInterval(checkState, 500);

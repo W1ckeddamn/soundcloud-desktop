@@ -1,9 +1,15 @@
 const DiscordRPC = require('discord-rpc');
+const path = require('path');
 const fs = require('fs');
 
-const logFile = 'D:\\soundcloud-desktop\\launch.log';
+const logFile = path.join(__dirname, '..', 'launch.log');
 function log(msg) {
-  try { fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${msg}\n`); } catch (e) {}
+  try {
+    fs.appendFile(logFile, `[${new Date().toISOString()}] [Discord RPC] ${msg}\n`, () => {});
+  } catch (e) {}
+  if (process.env.DEBUG_SOUNDCLOUD) {
+    console.log('[Discord RPC]', msg);
+  }
 }
 
 // Official PreMiD / Community SoundCloud Discord Application
@@ -14,6 +20,7 @@ let isConnected = false;
 let isConnecting = false;
 let rpcEnabled = true;
 let reconnectTimer = null;
+let idleClearTimer = null;
 let lastTrackKey = '';
 let lastPlayingState = null;
 let lastUpdateTime = 0;
@@ -29,15 +36,14 @@ function connectRPC() {
     rpcClient.on('ready', () => {
       isConnected = true;
       isConnecting = false;
-      console.log(`[Discord RPC] Connected to Discord as ${rpcClient.user ? rpcClient.user.username : 'User'}`);
+      log(`Connected to Discord as ${rpcClient.user ? rpcClient.user.username : 'User'}`);
       if (lastActivity) {
         setActivity(lastActivity);
       }
     });
 
-    rpcClient.on('error', (err) => {
+    rpcClient.on('error', () => {
       // Discord IPC errors are expected if Discord is closed/restarting
-      // Do not crash the application
     });
 
     rpcClient.transport.on('close', () => {
@@ -75,13 +81,12 @@ function setActivity(activity) {
 
   try {
     const rawActivity = {
-      type: 2, // 2 = Listening to (Слушает)
+      type: 2, // 2 = Listening to
       details: activity.details,
       state: activity.state,
       instance: false
     };
 
-    // Support both wrapper conventions (startTimestamp/endTimestamp) and nested timestamps
     if (activity.timestamps) {
       rawActivity.timestamps = activity.timestamps;
     } else if (activity.startTimestamp || activity.endTimestamp) {
@@ -99,43 +104,64 @@ function setActivity(activity) {
       rawActivity.buttons = activity.buttons;
     }
 
-    log(`[Discord RPC] Sending SET_ACTIVITY: ${JSON.stringify(rawActivity)}`);
+    log(`SET_ACTIVITY: "${rawActivity.details}" by ${rawActivity.state || 'SoundCloud'}`);
 
     rpcClient.request('SET_ACTIVITY', {
       pid: process.pid,
       activity: rawActivity
-    }).then((res) => {
-      log(`[Discord RPC] SET_ACTIVITY success: ${JSON.stringify(res)}`);
     }).catch((err) => {
-      log(`[Discord RPC] SET_ACTIVITY error: ${err ? (err.message || JSON.stringify(err)) : err}`);
-      console.warn('[Discord RPC] SET_ACTIVITY error:', err ? err.message : err);
+      log(`SET_ACTIVITY error: ${err ? err.message : err}`);
     });
   } catch (err) {
-    log(`[Discord RPC] setActivity exception: ${err ? err.stack : err}`);
-    console.warn('[Discord RPC] setActivity exception:', err);
+    log(`setActivity exception: ${err ? err.message : err}`);
   }
 }
 
 function clearActivity() {
+  if (idleClearTimer) {
+    clearTimeout(idleClearTimer);
+    idleClearTimer = null;
+  }
+  const hadActivity = lastActivity !== null || lastTrackKey !== '';
   lastActivity = null;
   lastTrackKey = '';
-  lastPlayingState = null;
+  lastPlayingState = false;
+
+  if (!hadActivity) return;
   if (!isConnected || !rpcClient) return;
+
   try {
-    rpcClient.request('SET_ACTIVITY', {
-      pid: process.pid
-    }).catch(() => {});
+    rpcClient.clearActivity().catch(() => {});
+    log('Cleared Rich Presence (idle/paused)');
   } catch (err) {}
 }
 
 function updateState(state) {
   if (!rpcEnabled) return;
 
-  if (!state || !state.hasTrack || !state.title) {
-    if (lastTrackKey) {
-      clearActivity();
+  // When nothing is playing (idle, paused, or no track), clear presence so Discord doesn't broadcast in idle
+  if (!state || !state.hasTrack || !state.title || !state.isPlaying) {
+    if (lastActivity) {
+      // Grace period (1.2s) avoids flickering when skipping tracks or scrubbing
+      if (!idleClearTimer) {
+        idleClearTimer = setTimeout(() => {
+          idleClearTimer = null;
+          clearActivity();
+        }, 1200);
+      }
+    } else {
+      if (idleClearTimer) {
+        clearTimeout(idleClearTimer);
+        idleClearTimer = null;
+      }
     }
     return;
+  }
+
+  // Playback is active: cancel any pending idle clear timer
+  if (idleClearTimer) {
+    clearTimeout(idleClearTimer);
+    idleClearTimer = null;
   }
 
   const trackKey = `${state.title}__${state.artist || ''}`;
@@ -159,14 +185,14 @@ function updateState(state) {
   const artwork = (state.artwork && state.artwork.startsWith('http')) ? state.artwork : 'soundcloud';
 
   const activity = {
-    type: 2, // 2 = Listening to (Слушает)
+    type: 2, // 2 = Listening to
     details: title,
     state: artist,
     assets: {
       large_image: artwork,
       large_text: title,
-      small_image: state.isPlaying ? 'play' : 'pause',
-      small_text: state.isPlaying ? 'Playing' : 'Paused'
+      small_image: 'play',
+      small_text: 'Playing'
     },
     instance: false
   };
@@ -183,36 +209,21 @@ function updateState(state) {
   const hasValidDuration = Number.isFinite(totalTrackDurationInSeconds) && totalTrackDurationInSeconds > 0;
   const validCurrentSeconds = (Number.isFinite(currentTrackTimeInSeconds) && currentTrackTimeInSeconds >= 0) ? currentTrackTimeInSeconds : 0;
 
-  if (state.isPlaying) {
-    if (hasValidDuration) {
-      const start = Math.round(now - (validCurrentSeconds * 1000));
-      const end = Math.round(start + (totalTrackDurationInSeconds * 1000));
+  if (hasValidDuration) {
+    const start = Math.round(now - (validCurrentSeconds * 1000));
+    const end = Math.round(start + (totalTrackDurationInSeconds * 1000));
 
-      console.log('[Discord RPC] Listening timestamps (ms):', {
-        currentTrackTimeInSeconds: validCurrentSeconds,
-        totalTrackDurationInSeconds,
-        start,
-        end
-      });
-
-      activity.startTimestamp = start;
-      activity.endTimestamp = end;
-      activity.timestamps = {
-        start,
-        end
-      };
-    } else {
-      console.log('[Discord RPC] Duration not available, elapsed only. durationSeconds =', state.durationSeconds);
-      activity.startTimestamp = now;
-      activity.timestamps = {
-        start: now
-      };
-    }
+    activity.startTimestamp = start;
+    activity.endTimestamp = end;
+    activity.timestamps = {
+      start,
+      end
+    };
   } else {
-    // When paused, do not pass timestamps so Discord stops the timer
-    delete activity.startTimestamp;
-    delete activity.endTimestamp;
-    delete activity.timestamps;
+    activity.startTimestamp = now;
+    activity.timestamps = {
+      start: now
+    };
   }
 
   setActivity(activity);
@@ -237,17 +248,28 @@ function isRPCEnabled() {
 }
 
 function destroy() {
+  if (idleClearTimer) {
+    clearTimeout(idleClearTimer);
+    idleClearTimer = null;
+  }
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
   if (rpcClient) {
-    try { rpcClient.destroy(); } catch (e) {}
+    try {
+      if (isConnected) {
+        rpcClient.clearActivity().catch(() => {});
+      }
+      rpcClient.destroy();
+    } catch (e) {}
     rpcClient = null;
   }
   isConnected = false;
   isConnecting = false;
   lastActivity = null;
+  lastTrackKey = '';
+  lastPlayingState = false;
 }
 
 module.exports = {
